@@ -1,0 +1,29 @@
+RewriteEngine On
+
+Options -Indexes
+
+# Ensure rewrite rules are applied
+RewriteOptions InheritDown
+
+
+# Route all /api/* to this directory's index.php.
+# Apache .htaccess patterns are relative to the current directory (public/),
+# so requests like /api/login appear as 'api/login' here.
+# If /api/* reaches Apache at this location, route to router.
+RewriteRule ^api/(.*)$ index.php [QSA,L]
+
+# If the router is hit via /public/api/*, also route to index.php.
+RewriteRule ^public/api/(.*)$ index.php [QSA,L]
+
+# If Apache receives /api/login as '/api/login' but this .htaccess is effectively
+# applied from the document root, also try matching the leading slash variant.
+RewriteRule ^/?api/(.*)$ index.php [QSA,L]
+
+
+
+# Also support calling the router directly (useful for debugging)
+RewriteRule ^index\.php$ index.php [QSA,L]
+
+
+
+
