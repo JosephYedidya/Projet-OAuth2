@@ -3,14 +3,22 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const cookieParser = require('cookie-parser');
 require('dotenv').config();
+
 
 const app = express();
 
 // Middleware
 app.use(express.json()); // JSON
 app.use(express.urlencoded({ extended: false })); // application/x-www-form-urlencoded (OAuth2)
-app.use(cors());
+app.use(cors({
+  origin: true,
+  credentials: true,
+}));
+
+app.use(cookieParser());
+
 
 // Connexion à MongoDB Atlas (avec options SSL pour éviter les erreurs)
 mongoose
@@ -28,30 +36,27 @@ mongoose
 // Models
 const User = require('./src/models/User');
 const Client = require('./src/models/Client');
-const RefreshToken = require('./src/models/RefreshToken');
+
 
 // OAuth helpers
 const {
   pickScopes,
   createAccessToken,
   createRefreshTokenRaw,
-  createRefreshToken,
   ACCESS_TOKEN_EXPIRES_IN,
   REFRESH_TOKEN_EXPIRES_IN,
-  hashRefreshToken,
 } = require('./src/oauth2');
-const { verifyRefreshToken } = require('./src/utils/refreshTokens');
 
 
-// Middleware pour vérifier le token JWT
+
+// Middleware pour vérifier le token JWT (depuis cookies HttpOnly)
 const authenticate = (req, res, next) => {
-  const token = req.header('Authorization')?.replace('Bearer ', '');
+  const token = req.cookies?.access_token || req.cookies?.token;
   if (!token) {
     return res.status(401).json({ error: 'Accès refusé : token manquant' });
   }
 
   try {
-    // OAuth2 access tokens are also JWTs (signed with OAUTH_TOKEN_SECRET)
     const secret = process.env.OAUTH_TOKEN_SECRET || process.env.JWT_SECRET;
     const decoded = jwt.verify(token, secret);
 
@@ -59,7 +64,6 @@ const authenticate = (req, res, next) => {
     req.scopes = decoded.scopes || [];
     next();
   } catch (err) {
-    // Backward compatibility: some tokens may still be signed with JWT_SECRET
     try {
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
       req.user = decoded;
@@ -70,6 +74,7 @@ const authenticate = (req, res, next) => {
     }
   }
 };
+
 
 const checkScope = (requiredScope) => (req, res, next) => {
   const scopes = req.scopes || [];
@@ -142,7 +147,11 @@ app.post('/public/api/login', async (req, res) => {
     process.env.JWT_SECRET,
     { expiresIn: '1h' }
   );
-  res.json({ token, role: user.role, email: user.email });
+
+  // HttpOnly cookie
+  setAccessCookie(res, token);
+  return res.status(200).json({ role: user.role, email: user.email });
+
 });
 
 // Route : Ajouter un utilisateur (Admin uniquement)
@@ -166,9 +175,42 @@ app.delete('/public/api/users/:id', authenticate, checkAdmin, async (req, res) =
   res.json({ message: 'Utilisateur supprimé' });
 });
 
+// Cookie settings (HttpOnly)
+function isProd() {
+  return process.env.NODE_ENV === 'production';
+}
+
+const cookieOptions = {
+  httpOnly: true,
+  sameSite: 'Lax',
+  secure: isProd(),
+  // path must be root so cookies are sent to all routes
+  path: '/',
+};
+
+function setAccessCookie(res, accessToken) {
+  res.cookie('access_token', accessToken, {
+    ...cookieOptions,
+    maxAge: ACCESS_TOKEN_EXPIRES_IN * 1000,
+  });
+}
+
+function setRefreshCookie(res, refreshToken) {
+  res.cookie('refresh_token', refreshToken, {
+    ...cookieOptions,
+    maxAge: REFRESH_TOKEN_EXPIRES_IN * 1000,
+  });
+}
+
+function clearAuthCookies(res) {
+  res.clearCookie('access_token', { path: '/' });
+  res.clearCookie('refresh_token', { path: '/' });
+}
+
 // OAuth2: token exchange + refresh tokens
 
 function normalizeScopeString(scopes) {
+
   if (!scopes) return '';
   if (Array.isArray(scopes)) return scopes.join(' ');
   return String(scopes);
@@ -252,91 +294,29 @@ app.post('/oauth/token', async (req, res) => {
       });
 
       const rawRefresh = createRefreshTokenRaw();
-      await createRefreshToken({
-        raw: rawRefresh,
-        userId: user._id,
-        clientId: client.clientId,
-        scopes: user.scopes || client.scopes,
-        RefreshTokenModel: RefreshToken,
-      });
 
-      // OAuth2 response format
+      // Cookie-only storage (HttpOnly)
+      setAccessCookie(res, accessToken);
+      setRefreshCookie(res, rawRefresh);
+
+      // Keep OAuth2 shape partially for clients, but tokens are in cookies
       return res.status(200).json({
-        access_token: accessToken,
         token_type: 'Bearer',
         expires_in: ACCESS_TOKEN_EXPIRES_IN,
-        refresh_token: rawRefresh,
         scope: normalizeScopeString(scopes.length ? scopes : user.scopes),
       });
+
     }
 
     if (grantType === 'refresh_token') {
-      if (!refreshToken) {
-        return res.status(400).json({
-          error: 'invalid_request',
-          error_description: 'refresh_token requis pour grant_type=refresh_token',
-        });
-      }
-
-      const refreshDocs = await RefreshToken.find({
-        clientId,
-        revokedAt: null,
-      });
-
-      // Find matching refresh token by comparing hashes
-      let match = null;
-      for (const doc of refreshDocs) {
-        const ok = await verifyRefreshToken({ raw: refreshToken, refreshTokenDoc: doc });
-        if (ok) {
-          match = doc;
-          break;
-        }
-      }
-
-      if (!match) {
-        return res.status(400).json({
-          error: 'invalid_grant',
-          error_description: 'Refresh token invalide',
-        });
-      }
-
-      const user = await User.findById(match.userId);
-      if (!user) {
-        return res.status(400).json({
-          error: 'invalid_grant',
-          error_description: 'User introuvable',
-        });
-      }
-
-      const scopes = match.scopes && match.scopes.length ? match.scopes : user.scopes;
-
-      const accessToken = createAccessToken({
-        user,
-        client,
-        scopes,
-      });
-
-      // Token rotation (simple): revoke old refresh token and issue a new one
-      match.revokedAt = new Date();
-      await match.save();
-
-      const rawRefresh = createRefreshTokenRaw();
-      await createRefreshToken({
-        raw: rawRefresh,
-        userId: user._id,
-        clientId: client.clientId,
-        scopes: scopes,
-        RefreshTokenModel: RefreshToken,
-      });
-
-      return res.status(200).json({
-        access_token: accessToken,
-        token_type: 'Bearer',
-        expires_in: ACCESS_TOKEN_EXPIRES_IN,
-        refresh_token: rawRefresh,
-        scope: normalizeScopeString(scopes),
+      // Cookie-based refresh flow uses /oauth/refresh endpoint.
+      // Keep this endpoint for OAuth2 compatibility but do not persist refresh tokens.
+      return res.status(400).json({
+        error: 'unsupported_grant_type',
+        error_description: 'Utilisez /oauth/refresh (refresh_token cookie) pour rafraîchir access_token',
       });
     }
+
 
     // Optional grant: client_credentials (not implementing as it is not in backend spec tests)
     return res.status(400).json({
@@ -349,7 +329,51 @@ app.post('/oauth/token', async (req, res) => {
   }
 });
 
+app.post('/oauth/refresh', async (req, res) => {
+  try {
+    const refreshToken = req.cookies?.refresh_token;
+    if (!refreshToken) {
+      clearAuthCookies(res);
+      return res.status(401).json({ error: 'refresh token manquant' });
+    }
+
+    // Refresh token is opaque in this implementation. We re-issue access_token by
+    // decoding user from access_token if present, otherwise fail.
+    // (Full persistent refresh tokens removed.)
+    const currentAccessToken = req.cookies?.access_token;
+    if (!currentAccessToken) {
+      clearAuthCookies(res);
+      return res.status(401).json({ error: 'access token manquant' });
+    }
+
+    const secret = process.env.OAUTH_TOKEN_SECRET || process.env.JWT_SECRET;
+    const decoded = jwt.verify(currentAccessToken, secret);
+
+    const user = await User.findById(decoded.id || decoded.sub);
+    if (!user) {
+      clearAuthCookies(res);
+      return res.status(401).json({ error: 'user introuvable' });
+    }
+
+    const scopes = user.scopes || [];
+    const client = await Client.findOne({});
+
+    const accessToken = createAccessToken({
+      user,
+      client,
+      scopes,
+    });
+
+    setAccessCookie(res, accessToken);
+    return res.status(200).json({});
+  } catch (err) {
+    clearAuthCookies(res);
+    return res.status(401).json({ error: 'refresh invalide' });
+  }
+});
+
 app.post('/oauth/revoke', async (req, res) => {
+
   const { client_id: clientId, client_secret: clientSecret, token } = req.body || {};
 
   if (!clientId || !clientSecret || !token) {
@@ -383,6 +407,12 @@ app.post('/oauth/revoke', async (req, res) => {
     console.error('OAuth2 /oauth/revoke error', err);
     return res.status(500).json({ error: 'server_error' });
   }
+});
+
+// Route : Déconnexion (clear cookies)
+app.post('/public/api/logout', async (req, res) => {
+  clearAuthCookies(res);
+  return res.status(200).json({ ok: true });
 });
 
 // Route : Vérifier le token (exchange/verification JWT)
